@@ -50,6 +50,17 @@ def test_framing_messages_are_dropped_not_shown_as_chat():
     assert events == []
 
 
+def test_a_mid_turn_format_error_correction_is_shown_not_dropped():
+    """Unlike the two bare framing messages above, a FormatError/InterruptAgentFlow correction is
+    ALSO role='user' but always carries an 'extra' dict (see minisweagent's own
+    parse_toolcall_actions) — dropping it the same way as framing silently erased the only sign
+    the model's tool call was malformed."""
+    events, _ = _run([_msg(role="user", content="No tool calls found in the response.",
+                           extra={"interrupt_type": "FormatError"})])
+    assert events == [{"type": "user", "message": {"content": [
+        {"type": "text", "text": "No tool calls found in the response."}]}}]
+
+
 def test_assistant_text_and_tool_call_become_one_message_two_blocks():
     events, state = _run(TOOL_RUN[3:4])
     assert events == [{"type": "assistant", "message": {"content": [
@@ -76,6 +87,13 @@ def test_result_reports_submission_and_summed_usage():
                           "result": "done", "usage": {"input_tokens": 120, "output_tokens": 30}}
 
 
+def test_an_intentional_empty_submission_is_kept_not_replaced_by_the_last_thought():
+    """`p.get("submission") or state.get("final", "")` would treat a real, deliberate '' the same
+    as a missing field and fall back to the last assistant text instead."""
+    events, _ = _run(TOOL_RUN[3:4] + [{"m": "__hr_result", "p": {"exit_status": "Submitted", "submission": ""}}])
+    assert events[-1]["result"] == ""
+
+
 # ── an execution failure (not a model refusal) surfaces as a tool error, not a turn error ──
 def test_an_execution_exception_marks_the_tool_result_an_error():
     events, _ = _run([_msg(content="<exception>boom</exception>...", extra={"exception_info": "boom",
@@ -87,14 +105,26 @@ def test_an_execution_exception_marks_the_tool_result_an_error():
 def test_limits_exceeded_is_a_soft_stop_not_an_error():
     events, _ = _run([{"m": "__hr_result", "p": {"exit_status": "LimitsExceeded", "submission": ""}}])
     assert events == [{"type": "result", "subtype": "error_max_turns", "is_error": False,
-                        "result": "", "usage": {}}]
+                        "result": "", "usage": {"input_tokens": 0, "output_tokens": 0}}]
 
 
 def test_a_driver_exception_is_a_hard_error():
     events, _ = _run([{"m": "__hr_result", "p": {"exit_status": "RuntimeError", "submission": "",
                                                 "error": "AuthenticationError: bad key"}}])
     assert events == [{"type": "result", "subtype": "error", "is_error": True,
-                        "result": "AuthenticationError: bad key", "usage": {}}]
+                        "result": "AuthenticationError: bad key",
+                        "usage": {"input_tokens": 0, "output_tokens": 0}}]
+
+
+def test_a_call_with_zero_new_input_tokens_still_reports_the_counter():
+    """A fully-cached call legitimately has 0 new input tokens — that must show as 0, not vanish
+    from usage the way `{k: v for ... if v}` used to make it."""
+    events, state = _run(TOOL_RUN[:4])
+    assert state["_mini_usage"]["input_tokens"] == 120
+    events, _ = _run([{"m": "message", "p": {"role": "assistant", "content": "ok",
+                        "extra": {"response": {"usage": {"prompt_tokens": 0, "completion_tokens": 5}}}}},
+                      {"m": "__hr_result", "p": {"exit_status": "Submitted", "submission": "done"}}])
+    assert events[-1]["usage"] == {"input_tokens": 0, "output_tokens": 5}
 
 
 # ── _build_mini: provider validation, model prefixing, agent_doc, the one-tool guard ───
@@ -115,6 +145,21 @@ def test_disabling_the_only_tool_is_rejected():
     with pytest.raises(HTTPException):
         _build_mini("anthropic", _auth(), "claude-sonnet-4.6", "task", "/tmp", {},
                    tools_disabled=["bash"])
+
+
+def test_disabling_the_only_tool_is_rejected_regardless_of_case_or_suffix():
+    import pytest
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException):
+        _build_mini("anthropic", _auth(), "claude-sonnet-4.6", "task", "/tmp", {},
+                   tools_disabled=["Bash (shell execution)"])
+
+
+def test_azure_provider_gets_the_azure_litellm_prefix():
+    env = {}
+    cmd = _build_mini("azure", _auth(base_url="https://x.openai.azure.com/openai/v1"),
+                      "gpt-5.4", "task", "/tmp", env)
+    assert json.loads(cmd[-1])["model"] == "azure/gpt-5.4"
 
 
 def test_claude_models_get_the_anthropic_litellm_prefix_openai_models_dont():

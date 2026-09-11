@@ -55,7 +55,15 @@ def test_custom_endpoint_with_a_known_catalogue_is_routed(monkeypatch):
                          "config": {"api_key": "k", "base_url": "http://llm.local/v1"}}])
     v = asyncio.run(app._vision_auth("s", "hermes"))
     assert v == {"provider": "openai-api", "model": "gpt-5.4-mini",
-                 "base_url": "http://llm.local/v1", "api_key": "k"}
+                 "base_url": "http://llm.local/v1", "api_key": "k", "extra_headers": None}
+
+
+def test_extra_headers_on_the_serving_connection_are_threaded_through(monkeypatch):
+    _with(monkeypatch, [{"name": "local", "provider": "openai-api",
+                         "config": {"api_key": "k", "base_url": "http://llm.local/v1",
+                                   "extra_headers": {"X-Project": "foo"}}}])
+    v = asyncio.run(app._vision_auth("s", "hermes"))
+    assert v["extra_headers"] == {"X-Project": "foo"}
 
 
 def test_no_session_means_none(monkeypatch):

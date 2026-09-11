@@ -34,6 +34,24 @@ def test_apply_extra_headers_with_none_extra_returns_base_copy():
     assert out == base and out is not base
 
 
+def test_apply_extra_headers_drops_a_value_with_an_embedded_newline():
+    """An embedded newline in an otherwise-permitted header's VALUE would forge a second header
+    line once _format_anthropic_custom_headers joins it — the same reserved-name bypass the key
+    check alone can't catch."""
+    out = rn._apply_extra_headers({}, {"X-Project": "foo\nauthorization: Bearer evil"})
+    assert out == {}
+
+
+def test_apply_extra_headers_drops_a_key_with_an_embedded_newline():
+    out = rn._apply_extra_headers({}, {"X-Project\nauthorization": "evil"})
+    assert out == {}
+
+
+def test_apply_extra_headers_drops_reserved_names_with_surrounding_whitespace():
+    out = rn._apply_extra_headers({}, {" Authorization ": "evil", "X-Project": "keep"})
+    assert out == {"X-Project": "keep"}
+
+
 def test_reserved_header_names_match_gateway_app():
     import os
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "gateway"))

@@ -282,7 +282,12 @@ install_backends() {
   # predates it, is named here rather than failing silently on the first turn.
   if wanted mini-swe-agent && [ ! -x "$(backend_bin mini-swe-agent)" ]; then
     if "$PY" -c "import minisweagent" 2>/dev/null; then
-      mkdir -p "$TOOLS" && printf '#!/bin/sh\ntrue\n' > "$TOOLS/mini-swe-agent-ready" && chmod +x "$TOOLS/mini-swe-agent-ready"
+      # `|| true`: this is bookkeeping, not an install — a failure here (read-only volume, disk
+      # full) must mark mini-swe-agent unavailable and WARN, the same as every other backend's
+      # try_install below, not abort startup for every backend under this script's `set -e`.
+      { mkdir -p "$TOOLS" && printf '#!/bin/sh\ntrue\n' > "$TOOLS/mini-swe-agent-ready" \
+        && chmod +x "$TOOLS/mini-swe-agent-ready"; } || \
+        echo "[harnessrouter] WARN: could not mark mini-swe-agent ready — it will not be available"
     else
       echo "[harnessrouter] WARN: mini-swe-agent is not importable on $PY — it will not be available"
       echo "[harnessrouter]   (expected: pinned in runner/requirements.txt and installed at image build)"

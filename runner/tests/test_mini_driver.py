@@ -111,3 +111,55 @@ def test_main_forwards_extra_headers_into_model_kwargs(monkeypatch, tmp_path):
 def test_main_with_no_extra_headers_env_omits_the_kwarg(monkeypatch, tmp_path):
     kwargs = _run_main(monkeypatch, tmp_path, env_extra_headers="{}")
     assert "extra_headers" not in kwargs
+
+
+# ── main(): an explicit cost_limit=0 in the job means "no limit", not "use the 3.0 default" ──
+def test_explicit_cost_limit_zero_is_not_overridden_by_the_default(monkeypatch, tmp_path):
+    captured = {}
+
+    class _StubAgent:
+        def __init__(self, model, env, *, cost_limit, step_limit, **kw):
+            captured["cost_limit"] = cost_limit
+
+        def run(self, prompt):
+            return {"exit_status": "Submitted", "submission": "done"}
+
+        cost = 0.0
+        n_calls = 0
+
+    monkeypatch.setattr(mini_driver, "StreamingAgent", _StubAgent)
+    monkeypatch.setattr(mini_driver, "LitellmModel", lambda **kw: None)
+    monkeypatch.setattr(mini_driver, "LocalEnvironment", lambda **kw: None)
+    monkeypatch.setenv("HR_MINI_API_KEY", "")
+    monkeypatch.setenv("HR_MINI_BASE_URL", "")
+    monkeypatch.delenv("HR_MINI_EXTRA_HEADERS", raising=False)
+    job = json.dumps({"prompt": "say hi", "model": "anthropic/claude-sonnet-4-6",
+                      "cwd": str(tmp_path), "cost_limit": 0})
+    monkeypatch.setattr(sys, "argv", ["mini_driver.py", job])
+    mini_driver.main()
+    assert captured["cost_limit"] == 0.0
+
+
+def test_cost_limit_absent_from_job_still_defaults_to_3(monkeypatch, tmp_path):
+    captured = {}
+
+    class _StubAgent:
+        def __init__(self, model, env, *, cost_limit, step_limit, **kw):
+            captured["cost_limit"] = cost_limit
+
+        def run(self, prompt):
+            return {"exit_status": "Submitted", "submission": "done"}
+
+        cost = 0.0
+        n_calls = 0
+
+    monkeypatch.setattr(mini_driver, "StreamingAgent", _StubAgent)
+    monkeypatch.setattr(mini_driver, "LitellmModel", lambda **kw: None)
+    monkeypatch.setattr(mini_driver, "LocalEnvironment", lambda **kw: None)
+    monkeypatch.setenv("HR_MINI_API_KEY", "")
+    monkeypatch.setenv("HR_MINI_BASE_URL", "")
+    monkeypatch.delenv("HR_MINI_EXTRA_HEADERS", raising=False)
+    job = json.dumps({"prompt": "say hi", "model": "anthropic/claude-sonnet-4-6", "cwd": str(tmp_path)})
+    monkeypatch.setattr(sys, "argv", ["mini_driver.py", job])
+    mini_driver.main()
+    assert captured["cost_limit"] == 3.0

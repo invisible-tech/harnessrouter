@@ -122,6 +122,29 @@ def test_hermes_vision_auth_is_its_own_route(tmp_path, monkeypatch):
     assert "k-vision" not in (tmp_path / ".hermes" / "config.yaml").read_text()
 
 
+def test_hermes_vision_auth_threads_extra_headers_to_its_relay_route(tmp_path, monkeypatch):
+    """The chat credential's extra_headers reach _hermes_relay_route (see the call a few lines
+    above this test's sibling); the vision sub-auth's own extra_headers must reach ITS relay call
+    the same way, not be silently dropped on the one path that used to omit the argument."""
+    calls = []
+
+    def _fake_relay_route(base, key, extra_headers=None):
+        calls.append((base, key, extra_headers))
+        return "http://127.0.0.1:1/v1", "hr-relay-placeholder"
+
+    env = {"HOME": str(tmp_path)}
+    monkeypatch.setattr(server, "_hermes_relay_route", _fake_relay_route)
+    # The chat credential also relays (openai-api, a base_url) — give it no extra_headers of its
+    # own so the two calls are distinguishable by key.
+    server._hermes_prepare_env("openai-api", server.Auth(api_key="k-chat", base_url="https://x/v1"),
+                               str(tmp_path), env, model="qwen/qwen3.8-max",
+                               vision_auth={"provider": "openai-api", "model": "gpt-5.4-mini",
+                                            "base_url": "https://vision.example/v1", "api_key": "k-vision",
+                                            "extra_headers": {"X-Project": "foo"}})
+    vision_calls = [c for c in calls if c[1] == "k-vision"]
+    assert len(vision_calls) == 1 and vision_calls[0][2] == {"X-Project": "foo"}
+
+
 def test_hermes_without_vision_auth_keeps_its_default(tmp_path):
     import yaml
     env = {"HOME": str(tmp_path)}
