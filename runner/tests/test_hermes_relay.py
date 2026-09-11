@@ -15,7 +15,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from server import _hermes_relay_route, _normalize_openai_chat_body  # noqa: E402
+from server import _gemini_relay_route, _hermes_relay_route, _normalize_openai_chat_body  # noqa: E402
 
 
 def _norm(obj):
@@ -107,6 +107,154 @@ def test_relay_refuses_an_unknown_token():
         raise AssertionError("expected 401")
     except urllib.error.HTTPError as e:
         assert e.code == 401
+
+
+# ── extra_headers: a connection's static headers, forwarded and never allowed to clobber the
+# real credential the relay injects (issue: product-level extra_headers contract) ──────────────
+
+def test_relay_forwards_extra_headers_to_upstream():
+    seen = {}
+
+    class Upstream(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers["content-length"]))
+            seen["x_project"] = self.headers.get("X-Project")
+            data = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    up = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    try:
+        base, tok = _hermes_relay_route(f"http://127.0.0.1:{up.server_address[1]}/v1", "sk-real",
+                                        extra_headers={"X-Project": "foo"})
+        req = urllib.request.Request(base + "/chat/completions", data=b"{}", method="POST",
+                                     headers={"authorization": f"Bearer {tok}",
+                                              "content-type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+        assert seen["x_project"] == "foo"
+    finally:
+        up.shutdown()
+
+
+def test_relay_strips_reserved_header_names_from_extra_headers():
+    seen = {}
+
+    class Upstream(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers["content-length"]))
+            seen["auth"] = self.headers.get("authorization")
+            data = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    up = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    try:
+        base, tok = _hermes_relay_route(f"http://127.0.0.1:{up.server_address[1]}/v1", "sk-real",
+                                        extra_headers={"Authorization": "Bearer evil"})
+        req = urllib.request.Request(base + "/chat/completions", data=b"{}", method="POST",
+                                     headers={"authorization": f"Bearer {tok}",
+                                              "content-type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+        assert seen["auth"] == "Bearer sk-real"
+    finally:
+        up.shutdown()
+
+
+def test_relay_extra_headers_survive_a_body_repair_retry():
+    calls = []
+
+    class Upstream(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):  # noqa: N802
+            body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            calls.append(self.headers.get("X-Project"))
+            if "max_tokens" in body:
+                data = (b'{"error": {"message": "Unsupported parameter: max_tokens is not '
+                        b'supported with this model. Use max_completion_tokens instead."}}')
+                self.send_response(400)
+            else:
+                data = b'{"ok": true}'
+                self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    up = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    try:
+        base, tok = _hermes_relay_route(f"http://127.0.0.1:{up.server_address[1]}/v1", "sk-real",
+                                        extra_headers={"X-Project": "foo"})
+        body = json.dumps({"model": "m", "max_tokens": 64,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        req = urllib.request.Request(base + "/chat/completions", data=body, method="POST",
+                                     headers={"authorization": f"Bearer {tok}",
+                                              "content-type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+        assert len(calls) == 2 and calls == ["foo", "foo"]
+    finally:
+        up.shutdown()
+
+
+def test_hermes_relay_route_with_no_extra_headers_is_unchanged():
+    base, tok = _hermes_relay_route("http://127.0.0.1:9/v1", "sk-x")
+    assert tok.startswith("hr-relay-")
+
+
+def test_gemini_relay_route_forwards_extra_headers():
+    seen = {}
+
+    class Upstream(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            seen["key"] = self.headers.get("x-goog-api-key")
+            seen["x_project"] = self.headers.get("X-Project")
+            data = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    up = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    try:
+        base, tok = _gemini_relay_route(f"http://127.0.0.1:{up.server_address[1]}", "goog-real",
+                                        extra_headers={"X-Project": "foo"})
+        req = urllib.request.Request(base + "/models/gemini-3.8-flash:generateContent",
+                                     data=b"{}", method="POST",
+                                     headers={"x-goog-api-key": tok, "content-type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+        assert seen["key"] == "goog-real" and seen["x_project"] == "foo"
+    finally:
+        up.shutdown()
 
 
 # ── max_tokens rename-on-rejection (opencode x custom-Azure, 2026-08-27) ───────────────────────

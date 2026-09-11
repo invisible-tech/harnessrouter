@@ -232,6 +232,22 @@ def test_a_served_model_other_than_the_one_asked_for_fails_the_turn():
 
 def test_the_default_model_is_the_newest_flash():
     assert BACKENDS["gemini"]["default_model"] == "gemini-3.8-flash"
+
+
+def test_gemini_threads_extra_headers_to_relay():
+    d = tempfile.mkdtemp(); env: dict = {}
+    _build_gemini("google", Auth(api_key="tr-real", base_url="https://api.tokenrouter.com/v1",
+                                 extra_headers={"X-Project": "foo"}), "gemini-3.8-flash", "hi", d, env)
+    _, _, flags = _HERMES_RELAY["routes"][env["GEMINI_API_KEY"]]
+    assert flags["extra_headers"] == {"X-Project": "foo"}
+
+
+def test_gemini_with_no_extra_headers_calls_relay_unchanged():
+    d = tempfile.mkdtemp(); env: dict = {}
+    _build_gemini("google", Auth(api_key="tr-real", base_url="https://api.tokenrouter.com/v1"),
+                 "gemini-3.8-flash", "hi", d, env)
+    _, _, flags = _HERMES_RELAY["routes"][env["GEMINI_API_KEY"]]
+    assert flags["extra_headers"] == {}
 def test_every_chain_is_one_policy_the_turns_own_model():
     """No fallback: gemini-cli's handler switches to the chain's next policy on a quota or transient
     error, silently in headless mode (a turn on gemini-3.8-flash finished on gemini-3-flash-preview,
@@ -264,7 +280,8 @@ def test_a_tokenrouter_connection_points_the_cli_at_the_relay_which_names_the_mo
     assert env["GEMINI_API_KEY"] != "tr-real"
     base, key, flags = _HERMES_RELAY["routes"][env["GEMINI_API_KEY"]]
     assert base == "https://api.tokenrouter.com" and key == "tr-real"
-    assert flags == {"google_native": True, "model": "gemini-3.8-flash", "native_model": "google/gemini-3.8-flash"}
+    assert flags == {"google_native": True, "model": "gemini-3.8-flash", "native_model": "google/gemini-3.8-flash",
+                    "extra_headers": {}}
     cfg = json.loads(pathlib.Path(d, ".harness", "home", ".gemini", "settings.json").read_text())
     assert cfg["modelConfigs"]["modelIdResolutions"]["gemini-3.8-flash"] == {"default": "gemini-3.8-flash", "contexts": []}
     d2 = tempfile.mkdtemp(); env2: dict = {}

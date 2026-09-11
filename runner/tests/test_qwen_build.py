@@ -5,7 +5,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from server import Auth, _agent_doc_path, _build_qwen, _claude_passthrough, BACKENDS  # noqa: E402
+from server import Auth, _agent_doc_path, _build_qwen, _claude_passthrough, BACKENDS, _HERMES_RELAY  # noqa: E402
 
 
 def _argv(**kw):
@@ -81,3 +81,21 @@ def test_normalizer_is_the_claude_passthrough():
 
 def test_instruction_file_is_qwen_md():
     assert _agent_doc_path("/ws", "qwen").name == "QWEN.md"
+
+
+def test_qwen_threads_extra_headers_to_relay():
+    d = tempfile.mkdtemp()
+    env = {}
+    _build_qwen("openai-api", Auth(api_key="sk-t", base_url="https://relay.example/v1",
+                                   extra_headers={"X-Project": "foo"}), "qwen3.7-max", "do it", d, env)
+    _, _, flags = _HERMES_RELAY["routes"][env["OPENAI_API_KEY"]]
+    assert flags["extra_headers"] == {"X-Project": "foo"}
+
+
+def test_qwen_with_no_extra_headers_calls_relay_unchanged():
+    d = tempfile.mkdtemp()
+    env = {}
+    _build_qwen("openai-api", Auth(api_key="sk-t", base_url="https://relay.example/v1"),
+               "qwen3.7-max", "do it", d, env)
+    _, _, flags = _HERMES_RELAY["routes"][env["OPENAI_API_KEY"]]
+    assert flags["extra_headers"] == {}

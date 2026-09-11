@@ -56,11 +56,14 @@ def main() -> None:
     # different means (there, a separate runtime process; here, no separate process at all).
     api_key = os.environ.pop("HR_MINI_API_KEY", "") or None
     base_url = os.environ.pop("HR_MINI_BASE_URL", "") or None
+    extra_headers = json.loads(os.environ.pop("HR_MINI_EXTRA_HEADERS", "") or "{}") or None
     model_kwargs: dict[str, object] = {"drop_params": True}
     if api_key:
         model_kwargs["api_key"] = api_key
     if base_url:
         model_kwargs["api_base"] = base_url
+    if extra_headers:
+        model_kwargs["extra_headers"] = extra_headers
 
     _emit("__hr_init", {})
     try:

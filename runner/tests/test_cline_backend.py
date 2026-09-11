@@ -12,7 +12,13 @@ import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from server import (Auth, BACKENDS, _agent_doc_path, _build_cline, _cline_eof,  # noqa: E402
-                    _cline_to_claude)
+                    _cline_to_claude, _HERMES_RELAY)
+
+
+def _relay_flags_from_settings(home_dir):
+    p = pathlib.Path(home_dir) / ".cline" / "data" / "settings" / "providers.json"
+    tok = json.loads(p.read_text())["providers"]["openai-compatible"]["settings"]["apiKey"]
+    return _HERMES_RELAY["routes"][tok][2]
 
 
 def _argv(prompt="do the thing", **kw):
@@ -142,3 +148,17 @@ def test_a_crash_before_run_result_still_yields_a_result():
     out = _cline_eof(state, 1)
     assert out and out[0]["is_error"] is True
     assert "exited 1" in out[0]["result"] or state.get("_cl_error", "") in out[0]["result"]
+
+
+def test_cline_threads_extra_headers_to_relay():
+    d = tempfile.mkdtemp(); env = {}
+    _build_cline("openai-api", Auth(api_key="sk-t", base_url="https://relay.example/v1",
+                                    extra_headers={"X-Project": "foo"}), "gpt-5.4", "do it", d, env)
+    assert _relay_flags_from_settings(env["HOME"])["extra_headers"] == {"X-Project": "foo"}
+
+
+def test_cline_with_no_extra_headers_calls_relay_unchanged():
+    d = tempfile.mkdtemp(); env = {}
+    _build_cline("openai-api", Auth(api_key="sk-t", base_url="https://relay.example/v1"),
+                "gpt-5.4", "do it", d, env)
+    assert _relay_flags_from_settings(env["HOME"])["extra_headers"] == {}
