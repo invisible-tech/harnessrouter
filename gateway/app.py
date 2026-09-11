@@ -830,7 +830,7 @@ def _policy_chain(raw: str) -> list[str]:
 
 _AUTH_FIELDS = ("api_key", "base_url", "aws_region", "aws_access_key_id", "aws_secret_access_key",
                 "aws_session_token", "aws_bearer_token", "gcp_project", "gcp_region",
-                "gcp_sa_json", "wire_api", "api_format", "full_url")
+                "gcp_sa_json", "wire_api", "api_format", "full_url", "extra_headers")
 
 
 # ── LLM egress broker ────────────────────────────────────────────────────────────────────────
@@ -4293,10 +4293,30 @@ class ConnBody(BaseModel):
     gcp_region: str | None = None
     gcp_sa_json: str | None = None
     wire_api: str | None = None
+    extra_headers: dict[str, str] | None = None    # static headers sent with every call on this connection
+
+
+# Header names no connection may set — the broker/relay always injects the real credential into
+# these itself, so a connection-supplied value would either be ignored or (worse) clobber it.
+# Duplicated in runner/server.py (separate process, no shared import); a test in each pins the
+# two lists equal so one can't drift without the other.
+_RESERVED_HEADER_NAMES = frozenset({"authorization", "x-api-key", "x-goog-api-key", "api-key",
+                                    "host", "content-length", "content-type", "connection",
+                                    "transfer-encoding", "accept-encoding"})
+
+
+def _validate_extra_headers(headers: dict[str, str] | None) -> dict[str, str] | None:
+    """400 if any key collides with _RESERVED_HEADER_NAMES (case-insensitively); otherwise
+    returns `headers` unchanged (never mutates casing)."""
+    for key in headers or {}:
+        if key.lower() in _RESERVED_HEADER_NAMES:
+            raise HTTPException(400, f"extra_headers cannot set reserved header {key!r}")
+    return headers
 
 
 @app.put("/v1/orgs/{org}/connections/{name}", dependencies=[Depends(_internal_only)])
 async def put_connection(org: str, name: str, body: ConnBody) -> dict:
+    _validate_extra_headers(body.extra_headers)
     conn = {"name": name, **{k: v for k, v in body.model_dump().items() if v is not None}}
     await _vault_put(org, f"harness-conn-{name}", json.dumps(conn))
     return {"ok": True, "org": org, "connection": _conn_public(conn)}

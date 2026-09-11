@@ -893,6 +893,25 @@ class Auth(BaseModel):
     # Custom provider
     api_format: str | None = None          # "openai" | "anthropic" (custom integration)
     full_url: str | None = None            # "1" when the URL is a complete request URL
+    extra_headers: dict[str, str] | None = None   # static headers, mirrors ConnBody.extra_headers
+
+
+# Duplicated from gateway/app.py deliberately (separate process, no shared import); a test in
+# each pins the two lists equal so one can't drift without the other.
+_RESERVED_HEADER_NAMES = frozenset({"authorization", "x-api-key", "x-goog-api-key", "api-key",
+                                    "host", "content-length", "content-type", "connection",
+                                    "transfer-encoding", "accept-encoding"})
+
+
+def _apply_extra_headers(base: dict[str, str], extra: dict[str, str] | None) -> dict[str, str]:
+    """New dict = `base` with `extra` merged in, dropping any key in `extra` that
+    case-insensitively matches _RESERVED_HEADER_NAMES. Never mutates `base`. The one function
+    every call site routes through — no backend builder hand-rolls its own stripping."""
+    out = dict(base)
+    for k, v in (extra or {}).items():
+        if k.lower() not in _RESERVED_HEADER_NAMES:
+            out[k] = v
+    return out
 
 
 # ── canonical-event normalizers ──────────────────────────────────────────────────
@@ -1216,6 +1235,14 @@ def _claude_thinking_env(model: str) -> dict:
 
 
 
+def _format_anthropic_custom_headers(headers: dict[str, str] | None) -> str:
+    """headers -> ANTHROPIC_CUSTOM_HEADERS' own format: one "Name: Value" pair per line, joined
+    on "\\n" (confirmed against the shipped CLI's own parser: `a.split("\\n")`, each line split on
+    its first ":", both sides trimmed). "" when headers is falsy — the caller must then OMIT the
+    env var rather than set it empty, since an empty string is still a truthy env var to the CLI."""
+    return "\n".join(f"{k}: {v}" for k, v in (headers or {}).items())
+
+
 def _build_claude(provider: str, auth: Auth, model: str, prompt: str, max_turns: int,
                   cwd: str, env: dict, resume_session_id: str | None = None,
                   mcp_config: str | None = None, disallowed_tools: list[str] | None = None,
@@ -1243,6 +1270,9 @@ def _build_claude(provider: str, auth: Auth, model: str, prompt: str, max_turns:
             # may not have access to it" (2026-09-06, measured on the self-hosted instance). The
             # router branch below has always stripped it; a direct key gets the same rule.
             env["ANTHROPIC_BASE_URL"] = auth.base_url.rstrip("/").removesuffix("/v1")
+        hdrs = _format_anthropic_custom_headers(_apply_extra_headers({}, auth.extra_headers))
+        if hdrs:
+            env["ANTHROPIC_CUSTOM_HEADERS"] = hdrs
     elif p == "bedrock":
         env["CLAUDE_CODE_USE_BEDROCK"] = "1"
         if auth.aws_region:
@@ -1277,6 +1307,9 @@ def _build_claude(provider: str, auth: Auth, model: str, prompt: str, max_turns:
             env["ANTHROPIC_BASE_URL"] = auth.base_url.rstrip("/").removesuffix("/v1")
         if auth.api_key:
             env["ANTHROPIC_AUTH_TOKEN"] = auth.api_key
+        hdrs = _format_anthropic_custom_headers(_apply_extra_headers({}, auth.extra_headers))
+        if hdrs:
+            env["ANTHROPIC_CUSTOM_HEADERS"] = hdrs
     cmd = ["claude", "-p", prompt, "--output-format", "stream-json",
            "--verbose", "--dangerously-skip-permissions", "--max-turns", str(max_turns)]
     if partial:   # token-level streaming: emit content_block_delta events (see _claude_passthrough)
@@ -1350,7 +1383,7 @@ name = "{name}"
 base_url = "{base_url}"
 env_key = "{env_key}"
 wire_api = "{wire_api}"
-[sandbox_workspace_write]
+{http_headers}[sandbox_workspace_write]
 network_access = true
 exclude_slash_tmp = false
 """
@@ -1359,7 +1392,19 @@ name = "{name}"
 base_url = "{base_url}"
 env_key = "{env_key}"
 wire_api = "{wire_api}"
-"""
+{http_headers}"""
+
+
+def _codex_http_headers_toml(headers: dict[str, str] | None) -> str:
+    """headers -> a TOML fragment for a [model_providers.X] table: an `http_headers` inline table
+    (confirmed against Codex's own config docs). "" when headers is falsy — the caller then splices
+    in nothing, same table as before this field existed. Keys/values are escaped via json.dumps:
+    TOML basic-string escaping is the same backslash/quote/control-char scheme JSON uses, so a
+    JSON string literal is also a valid TOML one — no hand-rolled quoting."""
+    if not headers:
+        return ""
+    pairs = ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in headers.items())
+    return f"http_headers = {{ {pairs} }}\n"
 
 
 _PROVIDER_REFUSAL = re.compile(r"\b(401|403|429|5\d\d)\b|unauthori[sz]ed|incorrect api key|invalid_api_key|invalid api key|"
@@ -1454,10 +1499,11 @@ def _codex_prepare_env(provider: str, auth: Auth, model: str, cwd: str,
     # codex at all (the gateway greys codex out for those integrations). Always the supported
     # "responses" value; a custom-endpoint turn against chat-only would 404 clearly rather than
     # crash on config load.
+    http_headers = _codex_http_headers_toml(_apply_extra_headers({}, auth.extra_headers))
     cfg = _CODEX_CONFIG_TMPL.format(
         model=model, provider=f"hr-{p}", effort=CODEX_REASONING_EFFORT, ctx=CODEX_CONTEXT_WINDOW,
         name=spec["name"], base_url=base_url, env_key=spec["env_key"],
-        wire_api=auth.wire_api or "responses")
+        wire_api=auth.wire_api or "responses", http_headers=http_headers)
     if resume:
         # A resumed session keeps the provider id it started under; Codex looks that id up in the
         # config and refuses to load without it ("Model provider `azure` not found", a July
@@ -1467,7 +1513,8 @@ def _codex_prepare_env(provider: str, auth: Auth, model: str, cwd: str,
             if alias == f"hr-{p}" or alias == "openai":     # the current one; a reserved built-in
                 continue
             cfg += _CODEX_ALIAS_TMPL.format(alias=alias, name=spec["name"], base_url=base_url,
-                                            env_key=spec["env_key"], wire_api=auth.wire_api or "responses")
+                                            env_key=spec["env_key"], wire_api=auth.wire_api or "responses",
+                                            http_headers=http_headers)
     if mcp_toml:   # owner-attached MCP servers via Codex's experimental rmcp HTTP client
         cfg += mcp_toml
     (cfg_dir / "config.toml").write_text(cfg)
@@ -1638,6 +1685,8 @@ DSH_DRIVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dsh_drive
 def _build_dsh(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
                resume_session_id: str | None = None,
                mcp_servers: list[dict] | None = None, vision: bool = True) -> list[str]:
+    # auth.extra_headers is not wired here: dsh drives its own vendored runtime/relay chain,
+    # separate from _HermesRelayHandler above — a known gap for header-gated providers.
     pr = provider or "deepseek"
     if pr not in DSH_PROVIDERS:
         raise HTTPException(400, f"unknown dsh provider '{pr}' (one of {sorted(DSH_PROVIDERS)})")
@@ -1832,6 +1881,7 @@ def _build_mini(provider: str, auth: Auth, model: str, prompt: str, cwd: str, en
     # a job file, or a runtime it spawns (there is none to spawn).
     env["HR_MINI_API_KEY"] = auth.api_key or ""
     env["HR_MINI_BASE_URL"] = auth.base_url or ""
+    env["HR_MINI_EXTRA_HEADERS"] = json.dumps(_apply_extra_headers({}, auth.extra_headers))
     # mini has no AGENTS.md-style discovery (see _agent_doc_path) — the file _write_agent_doc
     # wrote to the workspace sits there unread. Its content is prepended to the task instead, the
     # only channel mini's instance_template gives an instruction that isn't the task itself.
@@ -2005,7 +2055,7 @@ def _build_pi(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env:
             # relay repairs the request shape in flight (Google's OpenAI-compatible endpoint refuses
             # OpenAI's optional fields, measured 2026-09-06) and the key never lands in the
             # workspace's models.json, which is checkpointed. A custom endpoint keeps its own URL.
-            relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key)
+            relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key, auth.extra_headers)
             auth = auth.model_copy(update={"base_url": relay_base, "api_key": relay_tok})
         (home / ".pi" / "agent" / "models.json").write_text(
             _pi_models_json(api, auth.base_url, auth.api_key or "", model, vision=vision,
@@ -2277,7 +2327,7 @@ def _build_omp(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env
             # the request shape in flight (Gemini 3's thought signatures, TokenRouter's schema subset,
             # Azure's max_tokens), and the real key never lands in the workspace's models.yml. A
             # custom endpoint keeps its own URL.
-            relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key)
+            relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key, auth.extra_headers)
             auth = auth.model_copy(update={"base_url": relay_base, "api_key": relay_tok})
         models_content = _pi_models_json(api, auth.base_url, auth.api_key or "", model, vision=vision,
                                           custom_openai=bool(auth.api_format))
@@ -2833,6 +2883,7 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in drop}
         headers["authorization"] = f"Bearer {key}"
         headers.setdefault("accept", "*/*")
+        headers = _apply_extra_headers(headers, flags.get("extra_headers"))
         if flags.get("google_native"):
             # Google's native API on a provider that serves it (TokenRouter: models/google/<id>:
             # generateContent, measured 2026-09-07). The CLI asks for the canonical id, which its tables
@@ -3119,7 +3170,8 @@ def _relay_base_with_version(base_url: str) -> str:
     return base + "/v1"
 
 
-def _gemini_relay_route(host_root: str, api_key: str, model: str = "", native_model: str = "") -> tuple[str, str]:
+def _gemini_relay_route(host_root: str, api_key: str, model: str = "", native_model: str = "",
+                        extra_headers: dict[str, str] | None = None) -> tuple[str, str]:
     """Register one gemini turn's upstream for Google's native API on a provider that serves it: the
     host root, no version segment, since the CLI appends /v1beta/models/<id>:... itself and names the
     model the way the gateway resolved it through the connection's vendor table (google/<id> on
@@ -3132,11 +3184,13 @@ def _gemini_relay_route(host_root: str, api_key: str, model: str = "", native_mo
             _HERMES_RELAY["server"], _HERMES_RELAY["port"] = srv, srv.server_address[1]
         tok = "hr-relay-" + uuid.uuid4().hex
         _HERMES_RELAY["routes"][tok] = (host_root.rstrip("/"), api_key,
-                                        {"google_native": True, "model": model, "native_model": native_model})
+                                        {"google_native": True, "model": model, "native_model": native_model,
+                                         "extra_headers": _apply_extra_headers({}, extra_headers)})
     return f"http://127.0.0.1:{_HERMES_RELAY['port']}/v1", tok
 
 
-def _hermes_relay_route(base_url: str, api_key: str) -> tuple[str, str]:
+def _hermes_relay_route(base_url: str, api_key: str,
+                        extra_headers: dict[str, str] | None = None) -> tuple[str, str]:
     """Register one turn's upstream; → (relay base_url, placeholder bearer for the CLI)."""
     with _HERMES_RELAY["lock"]:
         if _HERMES_RELAY["server"] is None:
@@ -3150,7 +3204,9 @@ def _hermes_relay_route(base_url: str, api_key: str) -> tuple[str, str]:
         # https://api.anthropic.com/chat/completions, a 404 with no body (2026-09-06 support
         # matrix; Anthropic's OpenAI-compatible surface lives under /v1). Bedrock keeps its host
         # (its own path is built in _bedrock_anthropic).
-        _HERMES_RELAY["routes"][tok] = (_relay_base_with_version(base_url), api_key, {"rename_max_tokens": False})
+        _HERMES_RELAY["routes"][tok] = (_relay_base_with_version(base_url), api_key,
+                                        {"rename_max_tokens": False,
+                                         "extra_headers": _apply_extra_headers({}, extra_headers)})
     return f"http://127.0.0.1:{_HERMES_RELAY['port']}/v1", tok
 
 
@@ -3229,7 +3285,7 @@ def _hermes_prepare_env(provider: str | None, auth: Auth, cwd: str, env: dict,
             # are OpenAI-legal but fatal to aggregator translation are repaired before the
             # provider sees them, and the real key never enters the CLI's environment.
             env["OPENAI_BASE_URL"], env["OPENAI_API_KEY"] = _hermes_relay_route(
-                auth.base_url, auth.api_key)
+                auth.base_url, auth.api_key, auth.extra_headers)
         elif auth.api_key:
             env["OPENAI_API_KEY"] = auth.api_key
         elif auth.base_url:
@@ -3308,7 +3364,7 @@ def _build_qwen(provider: str, auth: Auth, model: str, prompt: str, cwd: str, en
         # against LLMTR; Azure's gpt-5.x deployments 400 on max_tokens), and the real key never
         # enters the CLI's environment — which matters more here than anywhere, because qwen
         # takes its credential ONLY via env.
-        relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key)
+        relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key, auth.extra_headers)
         auth = auth.model_copy(update={"base_url": relay_base, "api_key": relay_tok})
     home = pathlib.Path(cwd) / ".harness" / "home"
     home.mkdir(parents=True, exist_ok=True)
@@ -3461,7 +3517,8 @@ def _build_gemini(provider: str, auth: Auth, model: str, prompt: str, cwd: str, 
         # loopback relay, which owns the prefix and the real key; the CLI keeps its own model id, so
         # the pinned resolutions and the served-model check below are unchanged.
         root = urllib.parse.urlsplit(auth.base_url)
-        relay_base, relay_tok = _gemini_relay_route(f"{root.scheme}://{root.netloc}", auth.api_key, model, native_model or "")
+        relay_base, relay_tok = _gemini_relay_route(f"{root.scheme}://{root.netloc}", auth.api_key, model,
+                                                    native_model or "", extra_headers=auth.extra_headers)
         env["GOOGLE_GEMINI_BASE_URL"] = relay_base
         env["GEMINI_API_KEY"] = relay_tok
     else:
@@ -3553,7 +3610,7 @@ def _build_cline(provider: str, auth: Auth, model: str, prompt: str, cwd: str, e
         # Every cline turn rides the loopback relay (the qwen rationale, verbatim): request shapes
         # strict endpoints refuse are repaired in flight, and the real key never reaches the CLI —
         # what lands in its settings file is a placeholder valid for this turn, from loopback only.
-        relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key)
+        relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key, auth.extra_headers)
         auth = auth.model_copy(update={"base_url": relay_base, "api_key": relay_tok})
     home = pathlib.Path(cwd) / ".harness" / "home"
     home.mkdir(parents=True, exist_ok=True)
@@ -3872,7 +3929,7 @@ def _build_opencode(provider: str, auth: Auth, model: str, prompt: str, cwd: str
         # through the relay), and the real key stays in this process; opencode's env gets a
         # per-turn placeholder. A Messages-shape turn keeps its direct base: the relay speaks
         # bearer auth, and Anthropic takes the key in x-api-key.
-        relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key)
+        relay_base, relay_tok = _hermes_relay_route(auth.base_url, auth.api_key, auth.extra_headers)
         auth = auth.model_copy(update={"base_url": relay_base, "api_key": relay_tok})
     if auth.api_key:
         env[_OPENCODE_KEY_ENV] = auth.api_key

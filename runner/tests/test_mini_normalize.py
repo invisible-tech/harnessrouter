@@ -134,6 +134,24 @@ def test_the_credential_rides_env_not_the_job_argv():
     assert "sk-secret" not in cmd[-1]
 
 
+def test_build_mini_sets_hr_mini_extra_headers_env():
+    env = {}
+    _build_mini("anthropic", _auth(extra_headers={"X-Project": "foo"}), "claude-sonnet-4.6", "task", "/tmp", env)
+    assert env["HR_MINI_EXTRA_HEADERS"] == json.dumps({"X-Project": "foo"})
+
+
+def test_build_mini_strips_reserved_header_names_before_env():
+    env = {}
+    _build_mini("anthropic", _auth(extra_headers={"Authorization": "evil"}), "claude-sonnet-4.6", "task", "/tmp", env)
+    assert env["HR_MINI_EXTRA_HEADERS"] == "{}"
+
+
+def test_build_mini_with_no_extra_headers_sets_empty_json():
+    env = {}
+    _build_mini("anthropic", _auth(), "claude-sonnet-4.6", "task", "/tmp", env)
+    assert env["HR_MINI_EXTRA_HEADERS"] == "{}"
+
+
 def test_agent_doc_is_prepended_to_the_task_prompt():
     env = {}
     cmd = _build_mini("anthropic", _auth(), "claude-sonnet-4.6", "the task", "/tmp", env,
