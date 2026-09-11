@@ -4306,10 +4306,17 @@ _RESERVED_HEADER_NAMES = frozenset({"authorization", "x-api-key", "x-goog-api-ke
 
 
 def _validate_extra_headers(headers: dict[str, str] | None) -> dict[str, str] | None:
-    """400 if any key collides with _RESERVED_HEADER_NAMES (case-insensitively); otherwise
-    returns `headers` unchanged (never mutates casing)."""
-    for key in headers or {}:
-        if key.lower() in _RESERVED_HEADER_NAMES:
+    """400 if any key collides with _RESERVED_HEADER_NAMES (case-insensitively, after trimming
+    whitespace — the same trim the Claude CLI's own header-line parser applies) or if any key or
+    value carries an embedded newline/carriage-return. ANTHROPIC_CUSTOM_HEADERS joins headers
+    into one "Name: Value" line each (see runner/server.py's _format_anthropic_custom_headers);
+    an embedded "\\n" in an otherwise-permitted header's value forges a second line the CLI's own
+    parser reads as its own header, past this exact check. Otherwise returns `headers` unchanged
+    (never mutates casing)."""
+    for key, value in (headers or {}).items():
+        if "\n" in key or "\r" in key or "\n" in (value or "") or "\r" in (value or ""):
+            raise HTTPException(400, f"extra_headers {key!r} cannot contain a newline")
+        if key.strip().lower() in _RESERVED_HEADER_NAMES:
             raise HTTPException(400, f"extra_headers cannot set reserved header {key!r}")
     return headers
 
@@ -4636,6 +4643,10 @@ async def admin_integrations_put(body: IntegrationsBody, request: Request) -> di
         if not name or provider not in _PROVIDER_CATALOG:
             raise HTTPException(400, f"integration needs a name and a known provider (got '{provider}')")
         cfg = {k: v for k, v in (i.get("config") or {}).items() if v not in (None, "")}
+        # Same reserved-name/newline check put_connection runs on a connection's extra_headers —
+        # an integration's config reaches _auth_from_conn through the identical extra_headers
+        # field (see _vision_auth/_image_auth), so it must not skip the gate a connection gets.
+        _validate_extra_headers(cfg.get("extra_headers"))
         # The client never sees secrets (sentinel) — carry stored values through unchanged edits.
         prior_cfg = (stored.get(name) or {}).get("config") or {}
         for k in _INTEGRATION_SECRET_FIELDS:
@@ -5770,7 +5781,8 @@ async def _vision_auth(sid: str, backend: str) -> dict | None:
         if not auth or not auth.get("api_key"):
             continue
         return {"provider": provider, "model": served[canonical],
-                "base_url": auth.get("base_url") or "", "api_key": auth["api_key"]}
+                "base_url": auth.get("base_url") or "", "api_key": auth["api_key"],
+                "extra_headers": auth.get("extra_headers")}
     return None
 
 

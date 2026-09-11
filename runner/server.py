@@ -905,11 +905,19 @@ _RESERVED_HEADER_NAMES = frozenset({"authorization", "x-api-key", "x-goog-api-ke
 
 def _apply_extra_headers(base: dict[str, str], extra: dict[str, str] | None) -> dict[str, str]:
     """New dict = `base` with `extra` merged in, dropping any key in `extra` that
-    case-insensitively matches _RESERVED_HEADER_NAMES. Never mutates `base`. The one function
-    every call site routes through — no backend builder hand-rolls its own stripping."""
+    case-insensitively matches _RESERVED_HEADER_NAMES, or whose key/value carries an embedded
+    newline — gateway's _validate_extra_headers already rejects both at write time, but this is
+    the one function every call site routes through, so it re-checks rather than trusting that
+    every extra_headers value reaching this process came through that gate. A newline is not just
+    "an odd header": _format_anthropic_custom_headers below joins headers into ANTHROPIC_CUSTOM_
+    HEADERS one "Name: Value" line per header, and the shipped Claude CLI parses that by
+    splitting on "\\n" — so an embedded one forges an extra line the CLI reads as its own header,
+    reserved name included. Never mutates `base`."""
     out = dict(base)
     for k, v in (extra or {}).items():
-        if k.lower() not in _RESERVED_HEADER_NAMES:
+        if "\n" in k or "\r" in k or "\n" in (v or "") or "\r" in (v or ""):
+            continue
+        if k.strip().lower() not in _RESERVED_HEADER_NAMES:
             out[k] = v
     return out
 
@@ -1270,9 +1278,6 @@ def _build_claude(provider: str, auth: Auth, model: str, prompt: str, max_turns:
             # may not have access to it" (2026-09-06, measured on the self-hosted instance). The
             # router branch below has always stripped it; a direct key gets the same rule.
             env["ANTHROPIC_BASE_URL"] = auth.base_url.rstrip("/").removesuffix("/v1")
-        hdrs = _format_anthropic_custom_headers(_apply_extra_headers({}, auth.extra_headers))
-        if hdrs:
-            env["ANTHROPIC_CUSTOM_HEADERS"] = hdrs
     elif p == "bedrock":
         env["CLAUDE_CODE_USE_BEDROCK"] = "1"
         if auth.aws_region:
@@ -1307,9 +1312,14 @@ def _build_claude(provider: str, auth: Auth, model: str, prompt: str, max_turns:
             env["ANTHROPIC_BASE_URL"] = auth.base_url.rstrip("/").removesuffix("/v1")
         if auth.api_key:
             env["ANTHROPIC_AUTH_TOKEN"] = auth.api_key
-        hdrs = _format_anthropic_custom_headers(_apply_extra_headers({}, auth.extra_headers))
-        if hdrs:
-            env["ANTHROPIC_CUSTOM_HEADERS"] = hdrs
+    # ANTHROPIC_CUSTOM_HEADERS is a Claude Code CLI feature, not an anthropic/tokenrouter-specific
+    # one — it applies to whichever upstream the branches above configured (direct key, Bedrock,
+    # Vertex, or tokenrouter). Set once here rather than duplicated per branch, so bedrock/vertex
+    # don't silently miss a connection's extra_headers the way the anthropic/tokenrouter-only
+    # duplicate above used to.
+    hdrs = _format_anthropic_custom_headers(_apply_extra_headers({}, auth.extra_headers))
+    if hdrs:
+        env["ANTHROPIC_CUSTOM_HEADERS"] = hdrs
     cmd = ["claude", "-p", prompt, "--output-format", "stream-json",
            "--verbose", "--dangerously-skip-permissions", "--max-turns", str(max_turns)]
     if partial:   # token-level streaming: emit content_block_delta events (see _claude_passthrough)
@@ -1860,9 +1870,16 @@ def _mini_litellm_model(provider: str, auth: Auth, model: str) -> str:
     """litellm needs the provider as a model-name prefix; api_base/api_key (set by _build_mini
     as env for the driver, never as part of this string) carry the endpoint, so this only
     decides which litellm client the call reaches for — the same "is this claude" test pi
-    and dsh already use to pick their own API family."""
+    and dsh already use to pick their own API family.
+
+    "azure" gets its own prefix, not "openai/": litellm's azure client sends the key as
+    `api-key` (Azure OpenAI 401s on a bearer `Authorization` header) and adds the
+    `api-version` query param itself (defaulting to `litellm.AZURE_DEFAULT_API_VERSION` when
+    none is given) — both of which the generic "openai/" client skips entirely."""
     if auth.api_format == "anthropic" or provider == "anthropic" or _PI_CLAUDE_MODEL.search(model or ""):
         return f"anthropic/{model}"
+    if provider == "azure":
+        return f"azure/{model}"
     return f"openai/{model}"
 
 
@@ -1871,7 +1888,10 @@ def _build_mini(provider: str, auth: Auth, model: str, prompt: str, cwd: str, en
     pr = provider or "anthropic"
     if pr not in MINI_PROVIDERS:
         raise HTTPException(400, f"unknown mini-swe-agent provider '{pr}' (one of {sorted(MINI_PROVIDERS)})")
-    if "bash" in (tools_disabled or []):
+    # Normalized the same way every other backend's tools_disabled check in this file is
+    # (strip a "(...)" suffix, casefold) — a raw membership test missed "Bash" or a
+    # parenthetical-suffixed name, silently running with the tool enabled instead of refusing.
+    if "bash" in {t.split(" (")[0].strip().lower() for t in (tools_disabled or []) if t and t.strip()}:
         raise HTTPException(400, "mini-swe-agent has exactly one tool (bash) — disabling it "
                                  "leaves the agent with no way to act")
     if pr not in ("anthropic", "openai") and not auth.base_url:
@@ -1903,8 +1923,14 @@ def _mini_to_claude(obj: dict, state: dict) -> list[dict]:
         sid = state["_mini_session_id"] = state.get("_mini_session_id") or ("mini" + uuid.uuid4().hex)
         return [{"type": "system", "subtype": "init", "session_id": sid, "model": state.get("model")}]
     if m == "__hr_result":
-        usage = {k: v for k, v in (state.get("_mini_usage") or {}).items() if v}
-        final = p.get("submission") or state.get("final", "")
+        # `or {}` on the whole usage dict would also be correct here (an unstarted turn has none
+        # accumulated yet); filtering per-key on truthiness is what would wrongly hide a real,
+        # fully-cached call that legitimately used 0 new input tokens.
+        usage = {"input_tokens": 0, "output_tokens": 0, **(state.get("_mini_usage") or {})}
+        # `p.get("submission") or ...` would treat mini's own "nothing further to report" (a
+        # real, intentional empty string) the same as "no submission field at all", falling back
+        # to the last assistant text — which may be an earlier thought, not the actual answer.
+        final = p.get("submission") if p.get("submission") is not None else state.get("final", "")
         status = p.get("exit_status", "")
         if p.get("error"):
             return [{"type": "result", "subtype": "error", "is_error": True,
@@ -1917,8 +1943,17 @@ def _mini_to_claude(obj: dict, state: dict) -> list[dict]:
     if m != "message":
         return []
     role = p.get("role")
-    if role in ("system", "user"):
-        return []   # the framing template's system/instance messages — not the model's turn
+    if role == "system":
+        return []   # the framing template's system message — not the model's turn
+    if role == "user":
+        # The bare instance-template message (the task prompt) has no "extra" — that one really
+        # is framing. A LATER "user"-role message (a FormatError/InterruptAgentFlow correction,
+        # e.g. `{"extra": {"interrupt_type": "FormatError"}}`) always carries one, and dropping
+        # it here silently erased the only visible sign the model's tool call was malformed.
+        if not (p.get("extra") or {}):
+            return []
+        return [{"type": "user", "message": {"content": [
+            {"type": "text", "text": p.get("content") or ""}]}}]
     if role == "tool":
         extra = p.get("extra") or {}
         return [{"type": "user", "message": {"content": [
@@ -2898,7 +2933,7 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
         # fall through to a generic forward against a host with no such route.
         if (flags.get("bedrock_anthropic") and tail.split("?", 1)[0] == "/messages"
                 and body is not None):
-            self._bedrock_anthropic(base, key, body)
+            self._bedrock_anthropic(base, key, body, flags.get("extra_headers"))
             return
         try:
             _body_model = json.loads(body or b"{}").get("model") or ""
@@ -3036,7 +3071,8 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
 
-    def _bedrock_anthropic(self, origin: str, key: str, body: bytes) -> None:
+    def _bedrock_anthropic(self, origin: str, key: str, body: bytes,
+                           extra_headers: dict[str, str] | None = None) -> None:
         """Anthropic Messages -> Bedrock InvokeModel, both directions.
 
         Bedrock has NO bearer-auth /v1/messages surface (the path answers HTTP 200 wrapping
@@ -3069,12 +3105,17 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
         # sends for newer features get '<field>: Extra inputs are not permitted' (measured:
         # claude-code's context_management, 2026-08-27). Strip exactly the field the provider
         # names and retry — a fixed strip-list would silently rot as either side moves.
+        # This adapter used to build exactly these 3 headers and nothing else, so a connection's
+        # extra_headers never had anywhere to land on a Bedrock-Anthropic request — merge them in
+        # (still stripped of reserved names) rather than widen this to the full incoming header
+        # set, which would forward stray CLI headers to Bedrock that were never forwarded before.
+        req_headers = _apply_extra_headers({"authorization": f"Bearer {key}",
+                                            "content-type": "application/json",
+                                            "accept": "*/*"}, extra_headers)
         resp = None
         for _ in range(4):
             req = urllib.request.Request(url, data=json.dumps(obj).encode(), method="POST",
-                                         headers={"authorization": f"Bearer {key}",
-                                                  "content-type": "application/json",
-                                                  "accept": "*/*"})
+                                         headers=req_headers)
             try:
                 resp = urllib.request.urlopen(req, timeout=600)
                 break
@@ -3134,7 +3175,8 @@ class _HermesRelayHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _bedrock_anthropic_route(origin: str, api_key: str) -> tuple[str, str]:
+def _bedrock_anthropic_route(origin: str, api_key: str,
+                             extra_headers: dict[str, str] | None = None) -> tuple[str, str]:
     """Register a Bedrock-Anthropic adapter route; -> (relay base_url, placeholder bearer)."""
     with _HERMES_RELAY["lock"]:
         if _HERMES_RELAY["server"] is None:
@@ -3142,7 +3184,9 @@ def _bedrock_anthropic_route(origin: str, api_key: str) -> tuple[str, str]:
             threading.Thread(target=srv.serve_forever, daemon=True).start()
             _HERMES_RELAY["server"], _HERMES_RELAY["port"] = srv, srv.server_address[1]
         tok = "hr-relay-" + uuid.uuid4().hex
-        _HERMES_RELAY["routes"][tok] = (origin, api_key, {"bedrock_anthropic": True})
+        _HERMES_RELAY["routes"][tok] = (origin, api_key,
+                                        {"bedrock_anthropic": True,
+                                         "extra_headers": _apply_extra_headers({}, extra_headers)})
     return f"http://127.0.0.1:{_HERMES_RELAY['port']}/v1", tok
 
 
@@ -3158,7 +3202,7 @@ def _adapt_custom_auth(auth):
     host = urllib.parse.urlsplit(auth.base_url).hostname or ""
     if not (host.startswith("bedrock-runtime.") and host.endswith(".amazonaws.com")):
         return auth
-    base, tok = _bedrock_anthropic_route(f"https://{host}", auth.api_key)
+    base, tok = _bedrock_anthropic_route(f"https://{host}", auth.api_key, auth.extra_headers)
     return auth.model_copy(update={"base_url": base, "api_key": tok})
 
 
@@ -3254,7 +3298,7 @@ def _hermes_prepare_env(provider: str | None, auth: Auth, cwd: str, env: dict,
         vision: dict = {"provider": vp, "model": str(vision_auth["model"])}
         vkey, vbase = vision_auth.get("api_key") or "", vision_auth.get("base_url") or ""
         if vp == "openai-api" and vkey and vbase:
-            vbase, vkey = _hermes_relay_route(vbase, vkey)
+            vbase, vkey = _hermes_relay_route(vbase, vkey, vision_auth.get("extra_headers"))
         if vbase:
             vision["base_url"] = vbase
         if vkey:

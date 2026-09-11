@@ -23,7 +23,7 @@ import sys
 import traceback
 
 from minisweagent.agents.default import AgentConfig, DefaultAgent
-from minisweagent.config import get_config_from_spec
+from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments.local import LocalEnvironment, LocalEnvironmentConfig
 from minisweagent.models.litellm_model import LitellmModel
 
@@ -48,7 +48,10 @@ def main() -> None:
     prompt: str = job["prompt"]
     model_name: str = job["model"]
     cwd: str = job["cwd"]
-    cost_limit = float(job.get("cost_limit") or 0) or 3.0
+    # `or 3.0`/`or 0` would silently turn an explicit 0 (mini's own "no limit" convention — see
+    # AgentConfig.cost_limit/step_limit) into the 3.0 default; "cost_limit" absent from job is the
+    # only case that should fall back to it.
+    cost_limit = 3.0 if job.get("cost_limit") is None else float(job["cost_limit"])
     step_limit = int(job.get("step_limit") or 0)
 
     # HR_MINI_*: consumed here and never touched again — the API key lives only in this
@@ -67,7 +70,14 @@ def main() -> None:
 
     _emit("__hr_init", {})
     try:
-        cfg = get_config_from_spec("mini.yaml")
+        # An absolute path, not the bare name "mini.yaml": get_config_from_spec/get_config_path
+        # checks a CWD-relative candidate FIRST, and cwd here is the session's own workspace —
+        # the user's (or an untrusted branch's) checked-out repo content. A repo that happens to
+        # contain its own "mini.yaml" would silently replace this turn's system/instance
+        # templates (and, via cfg["environment"]["env"], the bash environment every action
+        # runs in) with attacker-controlled content instead of the bundled default. Naming the
+        # exact builtin file removes the ambiguity entirely.
+        cfg = get_config_from_spec(builtin_config_dir / "mini.yaml")
         agent_cfg = cfg.get("agent", {})
         model = LitellmModel(model_name=model_name, model_kwargs=model_kwargs,
                              observation_template=cfg.get("model", {}).get("observation_template",
