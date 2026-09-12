@@ -62,10 +62,12 @@ jobs:
     steps:
       - name: Work out the version
         id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            V='${{ inputs.version }}'
+            V="$INPUT_VERSION"
           else
             V="${GITHUB_REF_NAME#v}"
           fi
@@ -207,6 +209,8 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Create the manifest
+        env:
+          INPUT_LATEST: ${{ inputs.latest }}
         run: |
           set -euo pipefail
           V='${{ needs.plan.outputs.version }}'
@@ -217,7 +221,7 @@ jobs:
           done
           [ -n "$REFS" ] || { echo "::error::no digests to merge"; exit 1; }
           TAGS="-t ${{ env.IMAGE }}:$V"
-          if [ "${{ github.event_name }}" != workflow_dispatch ] || [ "${{ inputs.latest }}" = true ]; then
+          if [ "${{ github.event_name }}" != workflow_dispatch ] || [ "$INPUT_LATEST" = true ]; then
             TAGS="$TAGS -t ${{ env.IMAGE }}:latest"
           fi
           docker buildx imagetools create $TAGS $REFS

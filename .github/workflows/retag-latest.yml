@@ -27,19 +27,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check the version is a real published tag
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          V='${{ inputs.version }}'
-          case "$V" in
+          case "$VERSION" in
             [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::'$V' is not a semver version"; exit 1 ;;
+            *) echo "::error::'$VERSION' is not a semver version"; exit 1 ;;
           esac
           T=$(curl -sf "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE}:pull" | jq -r .token)
           code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" \
             -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
-            "https://registry-1.docker.io/v2/${IMAGE}/manifests/$V")
-          [ "$code" = 200 ] || { echo "::error::${IMAGE}:$V is not published (HTTP $code)"; exit 1; }
-          echo "$V is published"
+            "https://registry-1.docker.io/v2/${IMAGE}/manifests/$VERSION")
+          [ "$code" = 200 ] || { echo "::error::${IMAGE}:$VERSION is not published (HTTP $code)"; exit 1; }
+          echo "$VERSION is published"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -49,11 +50,15 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Point latest at it
-        run: docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${{ inputs.version }}"
+        env:
+          VERSION: ${{ inputs.version }}
+        run: docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:$VERSION"
 
       # Read it back from the registry rather than trusting the command's exit code: the whole
       # promise of this job is that the two tags are the same bytes.
       - name: Prove the two tags are one image
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           T=$(curl -sf "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE}:pull" | jq -r .token)
@@ -63,9 +68,9 @@ jobs:
               "https://registry-1.docker.io/v2/${IMAGE}/manifests/$1" \
               | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'
           }
-          A=$(dig "${{ inputs.version }}"); B=$(dig latest)
-          echo "${{ inputs.version }} = $A"
+          A=$(dig "$VERSION"); B=$(dig latest)
+          echo "$VERSION = $A"
           echo "latest = $B"
-          [ -n "$A" ] && [ "$A" = "$B" ] || { echo "::error::latest does not match ${{ inputs.version }}"; exit 1; }
-          echo "### latest now serves ${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$A" ] && [ "$A" = "$B" ] || { echo "::error::latest does not match $VERSION"; exit 1; }
+          echo "### latest now serves $VERSION" >> "$GITHUB_STEP_SUMMARY"
           echo "\`$A\`" >> "$GITHUB_STEP_SUMMARY"
