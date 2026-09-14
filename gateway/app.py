@@ -1065,6 +1065,14 @@ _INTEGRATION_WIRING: dict[tuple[str, str], str] = {
     ("openrouter", "cline"): "openai-api",
     ("tokenrouter", "cline"): "tokenrouter",   ("vercel", "cline"): "tokenrouter",
     ("llmtr", "cline"): "tokenrouter",
+    # mini-swe-agent calls litellm directly with no vendored runtime to relay for (see
+    # runner/mini_driver.py) — api_key/api_base are litellm kwargs, so every integration that
+    # carries a base_url drives it the same way pi/opencode/dsh already do.
+    ("anthropic", "mini-swe-agent"): "anthropic", ("openai", "mini-swe-agent"): "openai",
+    ("azure-foundry", "mini-swe-agent"): "azure",
+    ("openrouter", "mini-swe-agent"): "openai-api",
+    ("tokenrouter", "mini-swe-agent"): "tokenrouter", ("vercel", "mini-swe-agent"): "tokenrouter",
+    ("llmtr", "mini-swe-agent"): "tokenrouter",
     # custom: user-supplied endpoint + model + key. Maps to runner providers that can actually
     # drive a bring-your-own OpenAI/Anthropic endpoint — NOT codex, whose current releases speak
     # only the OpenAI Responses API and so cannot reach a custom chat/completions endpoint.
@@ -1074,6 +1082,7 @@ _INTEGRATION_WIRING: dict[tuple[str, str], str] = {
     ("custom", "omp"): "tokenrouter",
     ("custom", "qwen"): "openai-api",
     ("custom", "cline"): "openai-api",
+    ("custom", "mini-swe-agent"): "tokenrouter",
     # Google AI Studio: one key, Gemini's OpenAI-compatible chat-completions surface. Every
     # backend that talks OpenAI's chat shape through a base_url reaches it as 'openai-api'.
     # Not claude (Anthropic's protocol) and not codex (the Responses API): unprobed is unlisted.
@@ -1081,6 +1090,7 @@ _INTEGRATION_WIRING: dict[tuple[str, str], str] = {
     ("google", "dsh"): "openai-api",           ("google", "opencode"): "openai-api",
     ("google", "qwen"): "openai-api",          ("google", "cline"): "openai-api",
     ("google", "omp"): "openai-api",            # pi's lineage, pi's reach
+    ("google", "mini-swe-agent"): "openai-api",
     # gemini (Gemini CLI) speaks Google's native API, not the OpenAI shape the rows above reach
     # through a base_url, so it is wired to the google provider as itself: the runner gets the
     # raw key (owner trust only; see _NATIVE_ONLY_BACKENDS). No ("custom", "gemini") row, for the
@@ -4477,8 +4487,10 @@ def _provider_backends(provider: str) -> list[str]:
 _CUSTOM_FORMAT_BACKENDS = {
     # qwen-code is a pure OPENAI_BASE_URL/OPENAI_API_KEY client (0.22.1, verified), so a custom
     # OpenAI endpoint drives it directly; it speaks nothing else, so it stays off the anthropic set.
-    "openai": {"hermes", "opencode", "pi", "dsh", "qwen", "cline", "omp"},
-    "anthropic": {"claude", "opencode", "pi", "dsh", "omp"},
+    # mini-swe-agent is litellm, which speaks both shapes off the same api_key/api_base kwargs
+    # (see runner/mini_driver.py's _mini_litellm_model), so it joins pi/opencode/dsh/omp in both.
+    "openai": {"hermes", "opencode", "pi", "dsh", "qwen", "cline", "omp", "mini-swe-agent"},
+    "anthropic": {"claude", "opencode", "pi", "dsh", "omp", "mini-swe-agent"},
 }
 
 
@@ -5632,6 +5644,20 @@ _MODEL_CATALOG: dict[str, dict] = {
                       "gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "deepseek-v4-pro", "deepseek-v4-flash", "kimi-k3",
                       "kimi-k2.7-code", "qwen3.7-max", "qwen3.8-max",
                       "mistral-medium-3.5", "step-3.7-flash", "glm-5.3", "glm-5.3-flash"]},
+    # mini-swe-agent calls litellm's plain chat/completions path directly (no vendored CLI, no
+    # Responses-API route) — the qwen/cline class, not pi/opencode/dsh/omp's, so both
+    # Responses-only ids (gpt-5.3-codex, gpt-6-astra; see test_catalog_chat_only_backends.py)
+    # are dropped the same way cline's row drops them. STILL UNPROBED ON THIS BACKEND: probe
+    # before relying on any single row here — inheriting a serving path is not the same as a
+    # completed turn, the same caveat opencode's row above carries for the same reason.
+    "mini-swe-agent": {"default": "claude-sonnet-4.6",
+                       "models": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+                                  "gpt-5.4", "gpt-5.4-mini", "gpt-5.2",
+                                  "claude-opus-5", "claude-fable-5", "claude-fable-5-1", "claude-opus-4.8", "claude-sonnet-5",
+                                  "claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-4.5",
+                                  "gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "deepseek-v4-pro", "deepseek-v4-flash", "kimi-k3",
+                                  "kimi-k2.7-code", "qwen3.7-max", "qwen3.8-max",
+                                  "mistral-medium-3.5", "step-3.7-flash", "glm-5.3", "glm-5.3-flash"]},
     # gemini backend only speaks the native Google API (Path A: Gemini API Key), so unlike every
     # row above it cannot serve the whole cross-vendor catalogue through a relay — only Google's
     # own models, direct from Google. gemini-3.6-flash is live-turn verified (2026-09-06, a
@@ -12724,6 +12750,18 @@ _BASE_CATALOG: dict[str, dict] = {
                   ("fetch_web_content", "Web Fetch"), ("ask_question", "Question"),
                   ("spawn_agent", "Subagent")],
         "tool_enforcement": "instruction",
+    },
+    "mini-swe-agent": {
+        "label": "mini-SWE-agent", "backend": "mini-swe-agent", "status": "ready",
+        "system_prompt": ("You are a helpful assistant that can interact with a computer. You "
+                          "solve tasks by issuing bash commands one step at a time, observing "
+                          "each result before deciding the next one."),
+        # bash is the ONLY tool this agent has (see minisweagent/models/utils/actions_toolcall.py's
+        # BASH_TOOL) — there is no per-tool switch because there is only ever one tool. Disabling
+        # it is refused outright by the runner (_build_mini) rather than silently ignored, which is
+        # a stronger guarantee than "hard": it fails the request instead of running with it anyway.
+        "tools": [("bash", "Bash")],
+        "tool_enforcement": "hard",
     },
 }
 

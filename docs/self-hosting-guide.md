@@ -140,7 +140,7 @@ Wait for `ready on :3000`, then open the browser:
 [harnessrouter] installing Oh My Pi (MIT)…
 [harnessrouter] installing DeepSeek Harness (MIT, developer preview — version-pinned)…
 [harnessrouter] installing Hermes (check its upstream license before use)…
-[harnessrouter] data=/data  backends available: claude codex hermes pi dsh opencode qwen gemini cline omp
+[harnessrouter] data=/data  backends available: claude codex hermes pi dsh opencode qwen gemini cline omp mini-swe-agent
 [harnessrouter] ready on :3000
 ```
 
@@ -168,7 +168,10 @@ terms, which is also why you should read them before you use those two backends.
 the same way and under their own terms: Codex, Qwen Code, Gemini CLI and Cline (Apache-2.0),
 opencode and Pi (MIT, Pi with its MIT-licensed MCP adapter), Oh My Pi (MIT, a prebuilt binary
 pinned to a release and checked against the publisher's SHA256SUMS before it is installed) and
-DeepSeek Harness (MIT, a developer preview pinned to an exact version). All ten land in one place.
+DeepSeek Harness (MIT, a developer preview pinned to an exact version). mini-SWE-agent (MIT) is
+not on this list because it never was one of the ten fetched at first start: it is a pure-Python
+pip dependency pinned in `runner/requirements.txt`, so it ships already installed in the image
+like FastAPI or pydantic — no separate license-gated fetch, no line in this log.
 
 </details>
 
@@ -261,16 +264,16 @@ problem, because it only offers you providers that work.
 
 | Connection `provider` | Backends that can use it |
 |---|---|
-| `anthropic` | Claude Code, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi |
-| `openai` | Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi |
-| `openrouter` | Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi |
-| `azure-foundry` | Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi |
-| `google` | Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Gemini CLI, Cline, Oh My Pi |
+| `anthropic` | Claude Code, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi, mini-SWE-agent |
+| `openai` | Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi, mini-SWE-agent |
+| `openrouter` | Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi, mini-SWE-agent |
+| `azure-foundry` | Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi, mini-SWE-agent |
+| `google` | Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Gemini CLI, Cline, Oh My Pi, mini-SWE-agent |
 | `bedrock` | Claude Code, Hermes |
-| `tokenrouter` | Claude Code, Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Gemini CLI, Cline, Oh My Pi |
-| `vercel` | Claude Code, Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi |
-| `llmtr` | Claude Code, Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi |
-| `custom` | Claude Code, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi |
+| `tokenrouter` | Claude Code, Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Gemini CLI, Cline, Oh My Pi, mini-SWE-agent |
+| `vercel` | Claude Code, Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi, mini-SWE-agent |
+| `llmtr` | Claude Code, Codex, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi, mini-SWE-agent |
+| `custom` | Claude Code, Hermes, Pi, DeepSeek Harness, OpenCode, Qwen Code, Cline, Oh My Pi, mini-SWE-agent |
 
 </details>
 

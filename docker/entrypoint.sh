@@ -177,7 +177,7 @@ export HOSTNAME=0.0.0.0
 TOOLS="$DATA_DIR/agent-tools"
 export PATH="$TOOLS/bin:$PATH"
 export NODE_PATH="$TOOLS/lib/node_modules"
-export HR_BACKENDS="${HR_BACKENDS:-claude,codex,hermes,pi,dsh,opencode,qwen,gemini,cline,omp}"
+export HR_BACKENDS="${HR_BACKENDS:-claude,codex,hermes,pi,dsh,opencode,qwen,gemini,cline,omp,mini-swe-agent}"
 
 wanted()   { [[ ",$HR_BACKENDS," == *",$1,"* ]]; }
 # The executable IS the definition of "installed" — an installer that exits 0 without producing
@@ -195,6 +195,7 @@ backend_bin() {
     gemini) echo "$TOOLS/bin/gemini" ;;
     cline)  echo "$TOOLS/bin/cline" ;;
     omp)    echo "$TOOLS/bin/omp" ;;
+    mini-swe-agent) echo "$TOOLS/mini-swe-agent-ready" ;;
   esac
 }
 
@@ -272,6 +273,20 @@ install_backends() {
   if wanted claude && [ ! -x "$(backend_bin claude)" ]; then
     echo "[harnessrouter] installing Claude Code (Anthropic's terms apply)…"
     try_install "Claude Code" npm install -g --prefix "$TOOLS" --no-audit --no-fund @anthropic-ai/claude-code || true
+  fi
+
+  # mini-swe-agent (MIT) is not fetched here — it is a pure-Python pip dependency pinned in
+  # runner/requirements.txt, already installed into $PY (the same interpreter runner/server.py
+  # runs on, and the one mini_driver.py's MINI_PYTHON defaults to) at image build time. This is
+  # a presence check, not an install step: a build that skipped the pin, or a volume whose image
+  # predates it, is named here rather than failing silently on the first turn.
+  if wanted mini-swe-agent && [ ! -x "$(backend_bin mini-swe-agent)" ]; then
+    if "$PY" -c "import minisweagent" 2>/dev/null; then
+      mkdir -p "$TOOLS" && printf '#!/bin/sh\ntrue\n' > "$TOOLS/mini-swe-agent-ready" && chmod +x "$TOOLS/mini-swe-agent-ready"
+    else
+      echo "[harnessrouter] WARN: mini-swe-agent is not importable on $PY — it will not be available"
+      echo "[harnessrouter]   (expected: pinned in runner/requirements.txt and installed at image build)"
+    fi
   fi
 
   # opencode is MIT, so unlike Claude Code and hermes it COULD be baked into the image. It is

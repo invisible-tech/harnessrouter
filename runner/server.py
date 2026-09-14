@@ -35,6 +35,10 @@ Backends + providers (registry-driven — pi was added as exactly that one entry
     - azure         : models.json openai-responses + base_url
     - openai-api    : models.json openai-completions + base_url (generic aggregator)
     - tokenrouter   : models.json, api by model family (claude -> anthropic-messages)
+  backend "mini-swe-agent" (SWE-agent/mini-swe-agent; a pure-Python pip dependency, driven
+  in-process by runner/mini_driver.py via litellm.completion — no separate runtime to relay for):
+    - anthropic/openai : native key, litellm's api_key/api_base kwargs carry a custom base_url
+    - azure/openai-api/tokenrouter : same, litellm reached generically through api_base
 
 Creds are injected per-session via env (pool secrets) or a body `auth` override for spikes.
 Phase 0b: buffered turn. SSE streaming, git hydrate/commit, mid-turn /input, and the Node
@@ -52,6 +56,7 @@ import pathlib
 import re
 import shutil
 import signal
+import sys
 import socket
 import sqlite3
 import subprocess
@@ -814,6 +819,9 @@ def _agent_doc_path(cwd: str, backend: str) -> pathlib.Path:
         return pathlib.Path(cwd) / "QWEN.md"   # qwen-code's own context file (bundle default)
     if backend == "gemini":
         return pathlib.Path(cwd) / "GEMINI.md"   # gemini-cli's own context.fileName default
+    # mini-swe-agent has no file-based instruction discovery at all — falls to CLAUDE.md below
+    # as an unread audit artifact; _build_mini prepends agent_doc to the task prompt instead,
+    # the only channel that actually reaches it.
     return pathlib.Path(cwd) / (
         "AGENTS.md" if backend in ("codex", "hermes", "pi", "dsh", "opencode", "cline", "omp")
         else "CLAUDE.md")
@@ -1780,6 +1788,112 @@ def _dsh_to_claude(obj: dict, state: dict) -> list[dict]:
             state["_dsh_error"] = str((reason.get("error") or {}).get("message") or "dsh error")
         return []
     return []
+
+
+# ── mini-swe-agent (SWE-agent/mini-swe-agent) ───────────────────────────────────
+# The turn process is runner/mini_driver.py, in the SAME python env as this server — mini is a
+# pure-Python pip dependency (pinned in runner/requirements.txt), not a separate vendored
+# runtime like dsh's, so there is no relay boundary to build: the driver calls
+# `litellm.completion` in-process, and re-emits each agent message as one NDJSON line the
+# instant it's added (see mini_driver.py's StreamingAgent). Cancel is a process-group kill,
+# same as every other backend.
+# One tool only (bash, mini's sole action) — no MCP support and no per-tool switch to disable
+# it with, so a request to disable "bash" is refused up front rather than silently ignored.
+MINI_PROVIDERS = {"anthropic", "openai", "azure", "openai-api", "tokenrouter"}
+MINI_DEFAULT_MODEL = os.environ.get("MINI_DEFAULT_MODEL", "claude-sonnet-4.6")
+# Overridable for an operator who wants mini pinned to its own venv; defaults to running in
+# this server's own interpreter, since (unlike dsh) mini has no vendored binary to isolate from.
+MINI_PYTHON = os.environ.get("HR_MINI_PYTHON", sys.executable)
+MINI_DRIVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mini_driver.py")
+
+
+def _mini_litellm_model(provider: str, auth: Auth, model: str) -> str:
+    """litellm needs the provider as a model-name prefix; api_base/api_key (set by _build_mini
+    as env for the driver, never as part of this string) carry the endpoint, so this only
+    decides which litellm client the call reaches for — the same "is this claude" test pi
+    and dsh already use to pick their own API family."""
+    if auth.api_format == "anthropic" or provider == "anthropic" or _PI_CLAUDE_MODEL.search(model or ""):
+        return f"anthropic/{model}"
+    return f"openai/{model}"
+
+
+def _build_mini(provider: str, auth: Auth, model: str, prompt: str, cwd: str, env: dict,
+               tools_disabled: list[str] | None = None, agent_doc: str = "") -> list[str]:
+    pr = provider or "anthropic"
+    if pr not in MINI_PROVIDERS:
+        raise HTTPException(400, f"unknown mini-swe-agent provider '{pr}' (one of {sorted(MINI_PROVIDERS)})")
+    if "bash" in (tools_disabled or []):
+        raise HTTPException(400, "mini-swe-agent has exactly one tool (bash) — disabling it "
+                                 "leaves the agent with no way to act")
+    if pr not in ("anthropic", "openai") and not auth.base_url:
+        raise HTTPException(400, f"mini-swe-agent provider '{pr}' needs a base_url (none configured)")
+    # HR_MINI_*: read once by mini_driver.py's main() and popped from its own os.environ there —
+    # the credential lives only in that process's litellm.completion() call, never in an argv,
+    # a job file, or a runtime it spawns (there is none to spawn).
+    env["HR_MINI_API_KEY"] = auth.api_key or ""
+    env["HR_MINI_BASE_URL"] = auth.base_url or ""
+    # mini has no AGENTS.md-style discovery (see _agent_doc_path) — the file _write_agent_doc
+    # wrote to the workspace sits there unread. Its content is prepended to the task instead, the
+    # only channel mini's instance_template gives an instruction that isn't the task itself.
+    if agent_doc.strip():
+        prompt = f"{agent_doc}\n\n---\n\n{prompt}"
+    job = {"prompt": prompt, "model": _mini_litellm_model(pr, auth, model), "cwd": cwd}
+    return [MINI_PYTHON, MINI_DRIVER, json.dumps(job)]
+
+
+def _mini_to_claude(obj: dict, state: dict) -> list[dict]:
+    """Map ONE mini_driver.py NDJSON line to zero+ canonical claude stream-json events.
+
+    mini_driver.py re-emits DefaultAgent's own message dicts verbatim (see its docstring), so
+    this reads mini-SWE-agent's OWN message shapes directly — no wire protocol in between to
+    drift from. Usage is summed across assistant messages (one litellm call each, so unlike
+    dsh's streamed chunks there is no per-step retry to double-count)."""
+    m, p = obj.get("m"), obj.get("p") or {}
+    if m == "__hr_init":
+        sid = state["_mini_session_id"] = state.get("_mini_session_id") or ("mini" + uuid.uuid4().hex)
+        return [{"type": "system", "subtype": "init", "session_id": sid, "model": state.get("model")}]
+    if m == "__hr_result":
+        usage = {k: v for k, v in (state.get("_mini_usage") or {}).items() if v}
+        final = p.get("submission") or state.get("final", "")
+        status = p.get("exit_status", "")
+        if p.get("error"):
+            return [{"type": "result", "subtype": "error", "is_error": True,
+                     "result": p["error"], "usage": usage}]
+        if status in ("LimitsExceeded", "TimeExceeded", "RepeatedFormatError"):
+            return [{"type": "result", "subtype": "error_max_turns", "is_error": False,
+                     "result": final, "usage": usage}]
+        return [{"type": "result", "subtype": "success", "is_error": False,
+                 "result": final, "usage": usage}]
+    if m != "message":
+        return []
+    role = p.get("role")
+    if role in ("system", "user"):
+        return []   # the framing template's system/instance messages — not the model's turn
+    if role == "tool":
+        extra = p.get("extra") or {}
+        return [{"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": p.get("tool_call_id") or "mini",
+             "is_error": bool(extra.get("exception_info")), "content": p.get("content") or ""}]}}]
+    if role == "assistant":
+        extra = p.get("extra") or {}
+        u = (extra.get("response") or {}).get("usage") or {}
+        if u:
+            usage = state.setdefault("_mini_usage", {})
+            usage["input_tokens"] = usage.get("input_tokens", 0) + int(u.get("prompt_tokens") or 0)
+            usage["output_tokens"] = usage.get("output_tokens", 0) + int(u.get("completion_tokens") or 0)
+            cached = int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+            if cached:
+                usage["cache_read_tokens"] = usage.get("cache_read_tokens", 0) + cached
+        blocks = []
+        text = p.get("content")
+        if text:
+            state["final"] = text
+            blocks.append({"type": "text", "text": text})
+        for action in extra.get("actions") or []:
+            blocks.append({"type": "tool_use", "id": action.get("tool_call_id") or "mini",
+                            "name": "bash", "input": {"command": action.get("command", "")}})
+        return [{"type": "assistant", "message": {"content": blocks}}] if blocks else []
+    return []   # role "exit": folded into __hr_result above, not re-emitted as its own message
 
 
 # ── pi (earendil-works pi coding agent) ─────────────────────────────────────────
@@ -4015,6 +4129,8 @@ BACKENDS = {
            "normalize": _pi_to_claude},
     "dsh": {"providers": sorted(DSH_PROVIDERS), "default_model": DSH_DEFAULT_MODEL,
             "normalize": _dsh_to_claude},
+    "mini-swe-agent": {"providers": sorted(MINI_PROVIDERS), "default_model": MINI_DEFAULT_MODEL,
+                       "normalize": _mini_to_claude},
     "opencode": {"providers": sorted(OPENCODE_PROVIDERS), "default_model": OPENCODE_DEFAULT_MODEL,
                  "normalize": _opencode_to_claude},
     # qwen-code emits claude's stream-json natively (verified against the shipped 0.22.1:
@@ -5141,6 +5257,10 @@ def turn(req: TurnReq, identifier: str = "") -> dict:
         cmd = _build_pi(req.provider, auth, model, req.prompt, cwd, env,
                         resume_session_id=req.resume_session_id, mcp_servers=req.mcp_servers,
                         tools_disabled=req.tools_disabled, vision=bool(req.vision))
+    elif backend == "mini-swe-agent":
+        model = model or MINI_DEFAULT_MODEL
+        cmd = _build_mini(req.provider, auth, model, req.prompt, cwd, env,
+                          tools_disabled=req.tools_disabled, agent_doc=agent_doc)
     elif backend == "omp":
         model = model or OMP_DEFAULT_MODEL
         cmd = _build_omp(req.provider, auth, model, req.prompt, cwd, env,
