@@ -1,0 +1,5 @@
+# CODEOWNERS — defines who must review PRs for this repository.
+# Format: <path pattern> <GitHub team>
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+* @invisible-tech/applied-research
