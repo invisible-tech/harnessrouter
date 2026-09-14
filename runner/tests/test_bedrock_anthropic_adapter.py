@@ -118,6 +118,51 @@ def test_adapter_translates_both_directions():
         up.shutdown()
 
 
+def test_adapter_forwards_extra_headers_to_bedrock():
+    """_bedrock_anthropic used to hand-build exactly 3 headers and nothing else, so a
+    connection's extra_headers had no way to reach a Bedrock-Anthropic request at all."""
+    seen = {}
+
+    class FakeBedrock(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):  # noqa: N802
+            seen["x_project"] = self.headers.get("X-Project")
+            seen["auth"] = self.headers.get("authorization")
+            self.rfile.read(int(self.headers["content-length"]))
+            data = b'{"type": "message", "content": []}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    up = ThreadingHTTPServer(("127.0.0.1", 0), FakeBedrock)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    try:
+        base, tok = _bedrock_anthropic_route(f"http://127.0.0.1:{up.server_address[1]}", "bedrock-key",
+                                             extra_headers={"X-Project": "foo", "Authorization": "evil"})
+        body = json.dumps({"model": "m", "max_tokens": 8, "messages": []}).encode()
+        req = urllib.request.Request(base + "/messages", data=body, method="POST",
+                                     headers={"authorization": f"Bearer {tok}"})
+        urllib.request.urlopen(req, timeout=10)
+        assert seen["x_project"] == "foo"
+        assert seen["auth"] == "Bearer bedrock-key"   # extra_headers cannot clobber the real key
+    finally:
+        up.shutdown()
+
+
+def test_adapt_custom_auth_threads_extra_headers_through():
+    a = Auth(api_key="k", base_url="https://bedrock-runtime.us-west-2.amazonaws.com",
+             api_format="anthropic", extra_headers={"X-Project": "foo"})
+    b = _adapt_custom_auth(a)
+    from server import _HERMES_RELAY
+    assert _HERMES_RELAY["routes"][b.api_key][2]["extra_headers"] == {"X-Project": "foo"}
+
+
 def test_pop_json_path_handles_phantom_segments_and_list_siblings():
     from server import _pop_json_path
     # Bedrock reports tools.0.custom.eager_input_streaming for a tool whose JSON has no

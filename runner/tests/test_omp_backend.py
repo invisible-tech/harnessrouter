@@ -12,6 +12,7 @@ from server import (_same_model,   # noqa: E402
     _write_skills,
     Auth,
     BACKENDS,
+    _HERMES_RELAY,
 )
 
 
@@ -388,6 +389,28 @@ def test_omp_mcp_entries_carry_the_http_type_omp_requires(tmp_path):
     doc = json.loads((tmp_path / "mcp.json").read_text())
     assert doc["mcpServers"] == {"deepwiki": {"type": "http", "url": "https://mcp.deepwiki.com/mcp",
                                               "headers": {"Authorization": "Bearer tok"}}}
+
+
+def test_omp_threads_extra_headers_to_relay():
+    d = tempfile.mkdtemp()
+    env = {"HOME": d}
+    _build_omp("tokenrouter", Auth(api_key="real", base_url="https://api.tokenrouter.com/v1",
+                                   extra_headers={"X-Project": "foo"}), "gpt-5.4", "do work", d, env)
+    cfg = json.loads((pathlib.Path(d) / ".omp" / "agent" / "models.yml").read_text())
+    tok = cfg["providers"]["hr"]["apiKey"]
+    _, _, flags = _HERMES_RELAY["routes"][tok]
+    assert flags["extra_headers"] == {"X-Project": "foo"}
+
+
+def test_omp_with_no_extra_headers_calls_relay_unchanged():
+    d = tempfile.mkdtemp()
+    env = {"HOME": d}
+    _build_omp("tokenrouter", Auth(api_key="real", base_url="https://api.tokenrouter.com/v1"),
+              "gpt-5.4", "do work", d, env)
+    cfg = json.loads((pathlib.Path(d) / ".omp" / "agent" / "models.yml").read_text())
+    tok = cfg["providers"]["hr"]["apiKey"]
+    _, _, flags = _HERMES_RELAY["routes"][tok]
+    assert flags["extra_headers"] == {}
 
 
 def test_the_vendors_own_spelling_of_the_requested_model_is_not_a_substitution():
