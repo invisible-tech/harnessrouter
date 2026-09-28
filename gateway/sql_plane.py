@@ -306,5 +306,11 @@ async def introspect(engine: str, dsn: str, *, sample_rows: int = 0,
 
 def _quote_ident(engine: str, schema: str, table: str) -> str:
     if engine == "postgres":
-        return f'"{schema}"."{table}"'
-    return f"`{schema}`.`{table}`"
+        # Escape double quotes by doubling them
+        safe_schema = str(schema).replace('"', '""')
+        safe_table = str(table).replace('"', '""')
+        return f'"{safe_schema}"."{safe_table}"'
+    # MySQL/MariaDB: escape backticks by doubling them
+    safe_schema = str(schema).replace('`', '``')
+    safe_table = str(table).replace('`', '``')
+    return f"`{safe_schema}`.`{safe_table}`"
