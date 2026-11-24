@@ -40,7 +40,7 @@
     "cytoscape": "^3.34.0",
     "cytoscape-fcose": "^2.2.0",
     "date-fns": "^4.1.0",
-    "echarts": "^5.6.0",
+    "echarts": "^6.1.0",
     "echarts-for-react": "^3.0.6",
     "emoji-mart": "^5.6.0",
     "framer-motion": "^12.23.16",
